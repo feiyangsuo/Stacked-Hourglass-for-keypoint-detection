@@ -10,23 +10,24 @@ from keras.utils import multi_gpu_model
 from tqdm import tqdm
 import os
 import numpy as np
+import json
 import cv2
 import matplotlib
-# matplotlib.use('Agg')  # without this, matplotlib can't work in screen, causing crush
+matplotlib.use('Agg')  # without this, matplotlib can't work in screen, causing crush
 import matplotlib.pyplot as plt
 
 
 class Cfg:
     class Util:
-        model_generation  = 1  # change this value if don't want old model overwritten
+        model_generation  = 2  # change this value if don't want old model overwritten
         img_dir           = "data/Fish/Cropped.RandomSorted/"
         label_path        = "data/Fish/Annotations/keypoint/via_export_json.json"
-        candidates_dir    = "data/Fish/Cropped/"
+        candidates_dir    = "data/Fish/Cropped.RandomSorted/"
         img_data_shape    = (0, 64, 128, 3)
         mask_data_shape   = (0, 64, 128, 7)
         channel           = {"eye": 0, "mouth": 1, "backfin": 2, "chestfin": 3, "analfin": 4, "tail": 5, "backfin2": 6}
         keypoint_gaussian = True
-        do_training       = True
+        do_training       = False
         do_predicting     = True
     class Model:
         dim_output        = 7
@@ -84,9 +85,9 @@ def train(img_dir, label_path,
         model = multi_gpu_model(model, gpus=3)
 
     # compile model
-    loss_weights = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0]  # Weakening intermediate supervision. Add more value if there're more stages.
-    # loss_weights = [1, 1, 1, 1, 1, 1, 1]  # Full intermediate supervision
-    # loss_weights = [0, 0, 0, 0, 0, 0, 1]  # No intermediate supervision
+    loss_weights = [0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0]  # weakening intermediate supervision
+    # loss_weights = [1, 1, 1, 1, 1, 1, 1]  # full intermediate supervision
+    # loss_weights = [0, 0, 0, 0, 0, 0, 1]  # no intermediate supervision
     loss_weights = loss_weights[-n_hourglass:]
     loss_funcs = []
     for i in range(n_hourglass):
@@ -116,40 +117,56 @@ def train(img_dir, label_path,
     model_best.save_weights(model_save_path[:-3] + '_best.weights.h5')
 
 
-def predict(model_paths, res_save_dirs, confidence_threshold=0.5):
+def predict(model_paths, res_save_dirs, json_res_save_paths, confidence_threshold=0.5):
     candidates_dir = Cfg.Util.candidates_dir
     img_data_shape  = Cfg.Util.img_data_shape
     mask_data_shape = Cfg.Util.mask_data_shape
     n_hourglass = Cfg.Model.n_hourglass
+    keypoint_channel = Cfg.Util.channel
 
     print('loading image...')
     imgs, img_files, img_orisizes = load_data_candidate(img_dir=candidates_dir, img_data_shape=img_data_shape)
 
-    predict_task = zip(model_paths, res_save_dirs)
-    for (model_path, res_save_dir) in predict_task:
-        if os.path.exists(model_path):
-            if not os.path.exists(res_save_dir):
-                os.makedirs(res_save_dir)
-            print('loading model: ', os.path.split(model_path)[1], '...')
-            model = load_model(model_path, custom_objects={'loss_func_keypoint': keypoint_loss()})
-            print('predicting...')
-            m = imgs.shape[0]
-            for i in tqdm(range(m)):
-                img = imgs[i:i + 1]
-                img_file = img_files[i]
-                orisize = img_orisizes[i]
-                ress = model.predict(img)
-                for res, j in zip(ress, range(n_hourglass)):
-                    # mask = np.where(res > 0.5, 1, 0)
-                    mask = np.zeros((1, mask_data_shape[-3], mask_data_shape[-2], 0))
-                    for ch in range(res.shape[-1]):
-                        mask_single = res[:, :, :, ch:ch+1]
-                        mask_single = np.where(mask_single == np.max(mask_single), mask_single, 0)
-                        mask_single = np.where(mask_single > confidence_threshold, 1, 0)
-                        mask = np.concatenate((mask, mask_single), axis=-1)
-                    res_save_path = res_save_dir + '/keypoint_predicted_' + str(j) + '_' + img_file
-                    visualize_img_and_mask(img, mask, orisize, save_path=res_save_path)
-                print('(', i + 1, '/', m, ') images done')
+    predict_task = zip(model_paths, res_save_dirs, json_res_save_paths)
+    for (model_path, res_save_dir, json_res_save_path) in predict_task:
+        if not os.path.exists(model_path):
+            continue
+        if not os.path.exists(res_save_dir):
+            os.makedirs(res_save_dir)
+        json_res = {n: {} for n in range(n_hourglass)}
+        print('loading model: ', os.path.split(model_path)[1], '...')
+        model = load_model(model_path, custom_objects={'loss_func_keypoint': keypoint_loss()})  # without custom_objects, model won't recognize the loss defined by user
+        print('predicting...')
+        m = imgs.shape[0]
+        for i in tqdm(range(m)):
+            img = imgs[i:i + 1]
+            img_file = img_files[i]
+            orisize = img_orisizes[i]
+            json_index = "{}{}".format(img_file, orisize[0]*orisize[1])
+            ress = model.predict(img)
+            for res, j in zip(ress, range(n_hourglass)):
+                json_res[j][json_index] = {"filename": img_file,
+                                           "size": orisize[0] * orisize[1],
+                                           "regions": []}
+                # mask = np.where(res > 0.5, 1, 0)
+                mask = np.zeros((1, mask_data_shape[-3], mask_data_shape[-2], 0))
+                for ch in range(res.shape[-1]):
+                    keypoint_name = [k for k, v in keypoint_channel.items() if v == ch][0]
+                    mask_single = res[:, :, :, ch:ch+1]
+                    mask_single = np.where(mask_single == np.max(mask_single), mask_single, 0)
+                    mask_single = np.where(mask_single > confidence_threshold, 1, 0)
+                    mask = np.concatenate((mask, mask_single), axis=-1)
+                    _, y, x, _ = np.where(mask_single == 1)
+                    if len(x) > 0:
+                        x, y = x[0] * (orisize[0] / mask_data_shape[-2]), y[0] * (orisize[1] / mask_data_shape[-3])
+                        shape_attr = {"name": "point", "cx": x, "cy": y}
+                        region_attr = {"keypoint": keypoint_name}
+                        json_res[j][json_index]["regions"].append({"shape_attributes": shape_attr, "region_attributes": region_attr})
+                res_save_path = res_save_dir + '/keypoint_predicted_' + str(j) + '_' + img_file
+                visualize_img_and_mask(img, mask, orisize, save_path=res_save_path)
+            for n in range(n_hourglass):
+                with open(json_res_save_path[:-5]+".stage{}".format(n)+".json", "w") as f:
+                    json.dump(json_res[n], f)
 
 
 def visualize_hist(h, save_path=None):
@@ -181,14 +198,18 @@ def main():
 
     res_save_dir = 'keypoint for paper/results/predicted' + str(model_generation) + '/predicted'
     if do_predicting:
-        predict(model_paths=[model_save_path,
+        predict(model_paths=[#model_save_path,
                              model_save_path[:-3] + '_best.h5',
                              model_save_path[:-3] + '_finetune.h5',
                              model_save_path[:-3] + '_finetune_best.h5'],
-                res_save_dirs=[res_save_dir,
+                res_save_dirs=[#res_save_dir,
                                res_save_dir + '_best',
                                res_save_dir + '_finetune',
-                               res_save_dir + '_finetune_best'])
+                               res_save_dir + '_finetune_best'],
+                json_res_save_paths=[#res_save_dir + "res.json",
+                                     res_save_dir + "res_best.json",
+                                     res_save_dir + "res_finetune.json",
+                                     res_save_dir + "res_finetune_best.json",])
 
 
 if __name__ == '__main__':
